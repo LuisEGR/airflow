@@ -327,304 +327,303 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
 
         pool_num_starving_tasks: dict[str, int] = Counter()
 
-        for loop_count in itertools.count(start=1):
-            num_starved_pools = len(starved_pools)
-            num_starved_dags = len(starved_dags)
-            num_starved_tasks = len(starved_tasks)
-            num_starved_tasks_task_dagrun_concurrency = len(starved_tasks_task_dagrun_concurrency)
+        num_starved_pools = len(starved_pools)
+        num_starved_dags = len(starved_dags)
+        num_starved_tasks = len(starved_tasks)
+        num_starved_tasks_task_dagrun_concurrency = len(starved_tasks_task_dagrun_concurrency)
 
 
-            # Subquery to get the current active task count for each DAG
-            # Only considering tasks from running DAG runs
-            current_active_tasks = (
-                session.query(
-                    TI.dag_id,
-                    func.count().label('active_count')
-                )
-                .join(DR, and_(DR.dag_id == TI.dag_id, DR.run_id == TI.run_id))
-                .filter(DR.state == DagRunState.RUNNING)
-                .filter(TI.state.in_([TaskInstanceState.RUNNING, TaskInstanceState.QUEUED]))
-                .group_by(TI.dag_id)
-                .subquery()
+        # Subquery to get the current active task count for each DAG
+        # Only considering tasks from running DAG runs
+        current_active_tasks = (
+            session.query(
+                TI.dag_id,
+                func.count().label('active_count')
             )
+            .join(DR, and_(DR.dag_id == TI.dag_id, DR.run_id == TI.run_id))
+            .filter(DR.state == DagRunState.RUNNING)
+            .filter(TI.state.in_([TaskInstanceState.RUNNING, TaskInstanceState.QUEUED]))
+            .group_by(TI.dag_id)
+            .subquery()
+        )
 
-            # Get the limit for each DAG
-            dag_limit_subquery = (
-                session.query(
-                    DM.dag_id,
-                    func.greatest(DM.max_active_tasks - func.coalesce(current_active_tasks.c.active_count, 0), 0).label('dag_limit')
-                )
-                .outerjoin(current_active_tasks, DM.dag_id == current_active_tasks.c.dag_id)
-                .subquery()
+        # Get the limit for each DAG
+        dag_limit_subquery = (
+            session.query(
+                DM.dag_id,
+                func.greatest(DM.max_active_tasks - func.coalesce(current_active_tasks.c.active_count, 0), 0).label('dag_limit')
             )
+            .outerjoin(current_active_tasks, DM.dag_id == current_active_tasks.c.dag_id)
+            .subquery()
+        )
 
-            # Subquery to rank tasks within each DAG
-            ranked_tis = (
-                session.query(
-                    TI,
-                    func.row_number().over(
-                        partition_by=TI.dag_id,
-                        order_by=[desc(TI.priority_weight), TI.start_date]
-                    ).label('row_number'),
-                    dag_limit_subquery.c.dag_limit
-                )
-                .join(TI.dag_run)
-                .join(DM, TI.dag_id == DM.dag_id)
-                .join(dag_limit_subquery, TI.dag_id == dag_limit_subquery.c.dag_id)
-                .filter(
-                    DR.state == DagRunState.RUNNING,
-                    DR.run_type != DagRunType.BACKFILL_JOB,
-                    ~DM.is_paused,
-                    ~TI.dag_id.in_(starved_dags),
-                    ~TI.pool.in_(starved_pools),
-                    TI.state == TaskInstanceState.SCHEDULED,
-                )
-            ).subquery()
-
-            if starved_tasks:
-                task_filter = tuple_in_condition((TI.dag_id, TI.task_id), starved_tasks)
-                query = query.where(not_(task_filter))
-
-
-            final_query = (
-                session.query(TI)
-                .with_hint(TI, "USE INDEX (ti_state)", dialect_name="mysql")
-                .join(
-                    ranked_tis,
-                    and_(
-                        TI.task_id == ranked_tis.c.task_id,
-                        TI.dag_id == ranked_tis.c.dag_id,
-                        TI.run_id == ranked_tis.c.run_id
-                    )
-                )
-                .filter(ranked_tis.c.row_number <= ranked_tis.c.dag_limit)
-                .order_by(desc(ranked_tis.c.priority_weight), ranked_tis.c.start_date)
-                .limit(max_tis)
+        # Subquery to rank tasks within each DAG
+        ranked_tis = (
+            session.query(
+                TI,
+                func.row_number().over(
+                    partition_by=TI.dag_id,
+                    order_by=[desc(TI.priority_weight), TI.start_date]
+                ).label('row_number'),
+                dag_limit_subquery.c.dag_limit
             )
-            
-            
+            .join(TI.dag_run)
+            .join(DM, TI.dag_id == DM.dag_id)
+            .join(dag_limit_subquery, TI.dag_id == dag_limit_subquery.c.dag_id)
+            .filter(
+                DR.state == DagRunState.RUNNING,
+                DR.run_type != DagRunType.BACKFILL_JOB,
+                ~DM.is_paused,
+                ~TI.dag_id.in_(starved_dags),
+                ~TI.pool.in_(starved_pools),
+                TI.state == TaskInstanceState.SCHEDULED,
+            )
+        ).subquery()
 
-            timer = Stats.timer("scheduler.critical_section_query_duration")
-            timer.start()
+        if starved_tasks:
+            task_filter = tuple_in_condition((TI.dag_id, TI.task_id), starved_tasks)
+            query = query.where(not_(task_filter))
 
-            try:
-                query = with_row_locks(final_query, of=TI, session=session, skip_locked=True)
-                task_instances_to_examine: list[TI] = session.scalars(query).all()
 
-                timer.stop(send=True)
-            except OperationalError as e:
-                timer.stop(send=False)
-                raise e
+        final_query = (
+            session.query(TI)
+            .with_hint(TI, "USE INDEX (ti_state)", dialect_name="mysql")
+            .join(
+                ranked_tis,
+                and_(
+                    TI.task_id == ranked_tis.c.task_id,
+                    TI.dag_id == ranked_tis.c.dag_id,
+                    TI.run_id == ranked_tis.c.run_id
+                )
+            )
+            .filter(ranked_tis.c.row_number <= ranked_tis.c.dag_limit)
+            .order_by(desc(ranked_tis.c.priority_weight), ranked_tis.c.start_date)
+            .limit(max_tis)
+        )
+        
+        
 
-            # TODO[HA]: This was wrong before anyway, as it only looked at a sub-set of dags, not everything.
-            # Stats.gauge('scheduler.tasks.pending', len(task_instances_to_examine))
+        timer = Stats.timer("scheduler.critical_section_query_duration")
+        timer.start()
 
-            if not task_instances_to_examine:
-                self.log.debug("No tasks to consider for execution.")
-                break
+        try:
+            query = with_row_locks(final_query, of=TI, session=session, skip_locked=True)
+            task_instances_to_examine: list[TI] = session.scalars(query).all()
 
-            # Put one task instance on each line
-            task_instance_str = "\n".join(f"\t{x!r}" for x in task_instances_to_examine)
-            self.log.info("%s tasks up for execution:\n%s", len(task_instances_to_examine), task_instance_str)
+            timer.stop(send=True)
+        except OperationalError as e:
+            timer.stop(send=False)
+            raise e
 
-            executor_slots_available: dict[ExecutorName, int] = {}
-            # First get a mapping of executor names to slots they have available
-            for executor in self.job.executors:
-                if TYPE_CHECKING:
-                    # All executors should have a name if they are initted from the executor_loader.
-                    # But we need to check for None to make mypy happy.
-                    assert executor.name
-                executor_slots_available[executor.name] = executor.slots_available
+        # TODO[HA]: This was wrong before anyway, as it only looked at a sub-set of dags, not everything.
+        # Stats.gauge('scheduler.tasks.pending', len(task_instances_to_examine))
 
-            for task_instance in task_instances_to_examine:
-                pool_name = task_instance.pool
+        if not task_instances_to_examine:
+            self.log.debug("No tasks to consider for execution.")
+            break
 
-                pool_stats = pools.get(pool_name)
-                if not pool_stats:
-                    self.log.warning("Tasks using non-existent pool '%s' will not be scheduled", pool_name)
-                    starved_pools.add(pool_name)
-                    continue
+        # Put one task instance on each line
+        task_instance_str = "\n".join(f"\t{x!r}" for x in task_instances_to_examine)
+        self.log.info("%s tasks up for execution:\n%s", len(task_instances_to_examine), task_instance_str)
 
-                # Make sure to emit metrics if pool has no starving tasks
-                pool_num_starving_tasks.setdefault(pool_name, 0)
+        executor_slots_available: dict[ExecutorName, int] = {}
+        # First get a mapping of executor names to slots they have available
+        for executor in self.job.executors:
+            if TYPE_CHECKING:
+                # All executors should have a name if they are initted from the executor_loader.
+                # But we need to check for None to make mypy happy.
+                assert executor.name
+            executor_slots_available[executor.name] = executor.slots_available
 
-                pool_total = pool_stats["total"]
-                open_slots = pool_stats["open"]
+        for task_instance in task_instances_to_examine:
+            pool_name = task_instance.pool
 
-                if open_slots <= 0:
-                    self.log.info(
-                        "Not scheduling since there are %s open slots in pool %s", open_slots, pool_name
-                    )
-                    # Can't schedule any more since there are no more open slots.
-                    pool_num_starving_tasks[pool_name] += 1
-                    num_starving_tasks_total += 1
-                    starved_pools.add(pool_name)
-                    continue
+            pool_stats = pools.get(pool_name)
+            if not pool_stats:
+                self.log.warning("Tasks using non-existent pool '%s' will not be scheduled", pool_name)
+                starved_pools.add(pool_name)
+                continue
 
-                if task_instance.pool_slots > pool_total:
-                    self.log.warning(
-                        "Not executing %s. Requested pool slots (%s) are greater than "
-                        "total pool slots: '%s' for pool: %s.",
-                        task_instance,
-                        task_instance.pool_slots,
-                        pool_total,
-                        pool_name,
-                    )
+            # Make sure to emit metrics if pool has no starving tasks
+            pool_num_starving_tasks.setdefault(pool_name, 0)
 
-                    pool_num_starving_tasks[pool_name] += 1
-                    num_starving_tasks_total += 1
-                    starved_tasks.add((task_instance.dag_id, task_instance.task_id))
-                    continue
+            pool_total = pool_stats["total"]
+            open_slots = pool_stats["open"]
 
-                if task_instance.pool_slots > open_slots:
-                    self.log.info(
-                        "Not executing %s since it requires %s slots "
-                        "but there are %s open slots in the pool %s.",
-                        task_instance,
-                        task_instance.pool_slots,
-                        open_slots,
-                        pool_name,
-                    )
-                    pool_num_starving_tasks[pool_name] += 1
-                    num_starving_tasks_total += 1
-                    starved_tasks.add((task_instance.dag_id, task_instance.task_id))
-                    # Though we can execute tasks with lower priority if there's enough room
-                    continue
-
-                # Check to make sure that the task max_active_tasks of the DAG hasn't been
-                # reached.
-                dag_id = task_instance.dag_id
-                dag_run_key = (dag_id, task_instance.run_id)
-                current_active_tasks_per_dag_run = concurrency_map.dag_run_active_tasks_map[dag_run_key]
-                dag_max_active_tasks = task_instance.dag_model.max_active_tasks
+            if open_slots <= 0:
                 self.log.info(
-                    "DAG %s has %s/%s running and queued tasks",
+                    "Not scheduling since there are %s open slots in pool %s", open_slots, pool_name
+                )
+                # Can't schedule any more since there are no more open slots.
+                pool_num_starving_tasks[pool_name] += 1
+                num_starving_tasks_total += 1
+                starved_pools.add(pool_name)
+                continue
+
+            if task_instance.pool_slots > pool_total:
+                self.log.warning(
+                    "Not executing %s. Requested pool slots (%s) are greater than "
+                    "total pool slots: '%s' for pool: %s.",
+                    task_instance,
+                    task_instance.pool_slots,
+                    pool_total,
+                    pool_name,
+                )
+
+                pool_num_starving_tasks[pool_name] += 1
+                num_starving_tasks_total += 1
+                starved_tasks.add((task_instance.dag_id, task_instance.task_id))
+                continue
+
+            if task_instance.pool_slots > open_slots:
+                self.log.info(
+                    "Not executing %s since it requires %s slots "
+                    "but there are %s open slots in the pool %s.",
+                    task_instance,
+                    task_instance.pool_slots,
+                    open_slots,
+                    pool_name,
+                )
+                pool_num_starving_tasks[pool_name] += 1
+                num_starving_tasks_total += 1
+                starved_tasks.add((task_instance.dag_id, task_instance.task_id))
+                # Though we can execute tasks with lower priority if there's enough room
+                continue
+
+            # Check to make sure that the task max_active_tasks of the DAG hasn't been
+            # reached.
+            dag_id = task_instance.dag_id
+            dag_run_key = (dag_id, task_instance.run_id)
+            current_active_tasks_per_dag_run = concurrency_map.dag_run_active_tasks_map[dag_run_key]
+            dag_max_active_tasks = task_instance.dag_model.max_active_tasks
+            self.log.info(
+                "DAG %s has %s/%s running and queued tasks",
+                dag_id,
+                current_active_tasks_per_dag_run,
+                dag_max_active_tasks,
+            )
+            if current_active_tasks_per_dag_run >= dag_max_active_tasks:
+                self.log.info(
+                    "Not executing %s since the number of tasks running or queued "
+                    "from DAG %s is >= to the DAG's max_active_tasks limit of %s",
+                    task_instance,
                     dag_id,
-                    current_active_tasks_per_dag_run,
                     dag_max_active_tasks,
                 )
-                if current_active_tasks_per_dag_run >= dag_max_active_tasks:
-                    self.log.info(
-                        "Not executing %s since the number of tasks running or queued "
-                        "from DAG %s is >= to the DAG's max_active_tasks limit of %s",
-                        task_instance,
+                starved_dags.add(dag_id)
+                continue
+
+            if task_instance.dag_model.has_task_concurrency_limits:
+                # Many dags don't have a task_concurrency, so where we can avoid loading the full
+                # serialized DAG the better.
+                serialized_dag = self.dagbag.get_dag(dag_id, session=session)
+                # If the dag is missing, fail the task and continue to the next task.
+                if not serialized_dag:
+                    self.log.error(
+                        "DAG '%s' for task instance %s not found in serialized_dag table",
                         dag_id,
-                        dag_max_active_tasks,
+                        task_instance,
                     )
-                    starved_dags.add(dag_id)
+                    session.execute(
+                        update(TI)
+                        .where(TI.dag_id == dag_id, TI.state == TaskInstanceState.SCHEDULED)
+                        .values(state=TaskInstanceState.FAILED)
+                        .execution_options(synchronize_session="fetch")
+                    )
                     continue
 
-                if task_instance.dag_model.has_task_concurrency_limits:
-                    # Many dags don't have a task_concurrency, so where we can avoid loading the full
-                    # serialized DAG the better.
-                    serialized_dag = self.dagbag.get_dag(dag_id, session=session)
-                    # If the dag is missing, fail the task and continue to the next task.
-                    if not serialized_dag:
-                        self.log.error(
-                            "DAG '%s' for task instance %s not found in serialized_dag table",
-                            dag_id,
+                task_concurrency_limit: int | None = None
+                if serialized_dag.has_task(task_instance.task_id):
+                    task_concurrency_limit = serialized_dag.get_task(
+                        task_instance.task_id
+                    ).max_active_tis_per_dag
+
+                if task_concurrency_limit is not None:
+                    current_task_concurrency = concurrency_map.task_concurrency_map[
+                        (task_instance.dag_id, task_instance.task_id)
+                    ]
+
+                    if current_task_concurrency >= task_concurrency_limit:
+                        self.log.info(
+                            "Not executing %s since the task concurrency for"
+                            " this task has been reached.",
                             task_instance,
-                        )
-                        session.execute(
-                            update(TI)
-                            .where(TI.dag_id == dag_id, TI.state == TaskInstanceState.SCHEDULED)
-                            .values(state=TaskInstanceState.FAILED)
-                            .execution_options(synchronize_session="fetch")
-                        )
-                        continue
-
-                    task_concurrency_limit: int | None = None
-                    if serialized_dag.has_task(task_instance.task_id):
-                        task_concurrency_limit = serialized_dag.get_task(
-                            task_instance.task_id
-                        ).max_active_tis_per_dag
-
-                    if task_concurrency_limit is not None:
-                        current_task_concurrency = concurrency_map.task_concurrency_map[
-                            (task_instance.dag_id, task_instance.task_id)
-                        ]
-
-                        if current_task_concurrency >= task_concurrency_limit:
-                            self.log.info(
-                                "Not executing %s since the task concurrency for"
-                                " this task has been reached.",
-                                task_instance,
-                            )
-                            starved_tasks.add((task_instance.dag_id, task_instance.task_id))
-                            continue
-
-                    task_dagrun_concurrency_limit: int | None = None
-                    if serialized_dag.has_task(task_instance.task_id):
-                        task_dagrun_concurrency_limit = serialized_dag.get_task(
-                            task_instance.task_id
-                        ).max_active_tis_per_dagrun
-
-                    if task_dagrun_concurrency_limit is not None:
-                        current_task_dagrun_concurrency = concurrency_map.task_dagrun_concurrency_map[
-                            (task_instance.dag_id, task_instance.run_id, task_instance.task_id)
-                        ]
-
-                        if current_task_dagrun_concurrency >= task_dagrun_concurrency_limit:
-                            self.log.info(
-                                "Not executing %s since the task concurrency per DAG run for"
-                                " this task has been reached.",
-                                task_instance,
-                            )
-                            starved_tasks_task_dagrun_concurrency.add(
-                                (task_instance.dag_id, task_instance.run_id, task_instance.task_id)
-                            )
-                            continue
-
-                if executor_obj := self._try_to_load_executor(task_instance.executor):
-                    if TYPE_CHECKING:
-                        # All executors should have a name if they are initted from the executor_loader.
-                        # But we need to check for None to make mypy happy.
-                        assert executor_obj.name
-                    if executor_slots_available[executor_obj.name] <= 0:
-                        self.log.debug(
-                            "Not scheduling %s since its executor %s does not currently have any more "
-                            "available slots"
                         )
                         starved_tasks.add((task_instance.dag_id, task_instance.task_id))
                         continue
-                    else:
-                        executor_slots_available[executor_obj.name] -= 1
-                else:
-                    # This is a defensive guard for if we happen to have a task who's executor cannot be
-                    # found. The check in the dag parser should make this not realistically possible but the
-                    # loader can fail if some direct DB modification has happened or another as yet unknown
-                    # edge case. _try_to_load_executor will log an error message explaining the executor
-                    # cannot be found.
+
+                task_dagrun_concurrency_limit: int | None = None
+                if serialized_dag.has_task(task_instance.task_id):
+                    task_dagrun_concurrency_limit = serialized_dag.get_task(
+                        task_instance.task_id
+                    ).max_active_tis_per_dagrun
+
+                if task_dagrun_concurrency_limit is not None:
+                    current_task_dagrun_concurrency = concurrency_map.task_dagrun_concurrency_map[
+                        (task_instance.dag_id, task_instance.run_id, task_instance.task_id)
+                    ]
+
+                    if current_task_dagrun_concurrency >= task_dagrun_concurrency_limit:
+                        self.log.info(
+                            "Not executing %s since the task concurrency per DAG run for"
+                            " this task has been reached.",
+                            task_instance,
+                        )
+                        starved_tasks_task_dagrun_concurrency.add(
+                            (task_instance.dag_id, task_instance.run_id, task_instance.task_id)
+                        )
+                        continue
+
+            if executor_obj := self._try_to_load_executor(task_instance.executor):
+                if TYPE_CHECKING:
+                    # All executors should have a name if they are initted from the executor_loader.
+                    # But we need to check for None to make mypy happy.
+                    assert executor_obj.name
+                if executor_slots_available[executor_obj.name] <= 0:
+                    self.log.debug(
+                        "Not scheduling %s since its executor %s does not currently have any more "
+                        "available slots"
+                    )
                     starved_tasks.add((task_instance.dag_id, task_instance.task_id))
                     continue
+                else:
+                    executor_slots_available[executor_obj.name] -= 1
+            else:
+                # This is a defensive guard for if we happen to have a task who's executor cannot be
+                # found. The check in the dag parser should make this not realistically possible but the
+                # loader can fail if some direct DB modification has happened or another as yet unknown
+                # edge case. _try_to_load_executor will log an error message explaining the executor
+                # cannot be found.
+                starved_tasks.add((task_instance.dag_id, task_instance.task_id))
+                continue
 
-                executable_tis.append(task_instance)
-                open_slots -= task_instance.pool_slots
-                concurrency_map.dag_run_active_tasks_map[dag_run_key] += 1
-                concurrency_map.task_concurrency_map[(task_instance.dag_id, task_instance.task_id)] += 1
-                concurrency_map.task_dagrun_concurrency_map[
-                    (task_instance.dag_id, task_instance.run_id, task_instance.task_id)
-                ] += 1
+            executable_tis.append(task_instance)
+            open_slots -= task_instance.pool_slots
+            concurrency_map.dag_run_active_tasks_map[dag_run_key] += 1
+            concurrency_map.task_concurrency_map[(task_instance.dag_id, task_instance.task_id)] += 1
+            concurrency_map.task_dagrun_concurrency_map[
+                (task_instance.dag_id, task_instance.run_id, task_instance.task_id)
+            ] += 1
 
-                pool_stats["open"] = open_slots
+            pool_stats["open"] = open_slots
 
-            is_done = executable_tis or len(task_instances_to_examine) < max_tis
-            # Check this to avoid accidental infinite loops
-            found_new_filters = (
-                len(starved_pools) > num_starved_pools
-                or len(starved_dags) > num_starved_dags
-                or len(starved_tasks) > num_starved_tasks
-                or len(starved_tasks_task_dagrun_concurrency) > num_starved_tasks_task_dagrun_concurrency
-            )
+        is_done = executable_tis or len(task_instances_to_examine) < max_tis
+        # Check this to avoid accidental infinite loops
+        found_new_filters = (
+            len(starved_pools) > num_starved_pools
+            or len(starved_dags) > num_starved_dags
+            or len(starved_tasks) > num_starved_tasks
+            or len(starved_tasks_task_dagrun_concurrency) > num_starved_tasks_task_dagrun_concurrency
+        )
 
-            if is_done or not found_new_filters:
-                break
+        if is_done or not found_new_filters:
+            break
 
-            self.log.info(
-                "Found no task instances to queue on query iteration %s "
-                "but there could be more candidate task instances to check.",
-                loop_count,
-            )
+        self.log.info(
+            "Found no task instances to queue on query iteration %s "
+            "but there could be more candidate task instances to check.",
+            loop_count,
+        )
 
         for pool_name, num_starving_tasks in pool_num_starving_tasks.items():
             Stats.gauge(f"pool.starving_tasks.{pool_name}", num_starving_tasks)
