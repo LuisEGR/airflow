@@ -333,42 +333,82 @@ class SchedulerJobRunner(BaseJobRunner, LoggingMixin):
             num_starved_tasks = len(starved_tasks)
             num_starved_tasks_task_dagrun_concurrency = len(starved_tasks_task_dagrun_concurrency)
 
-            query = (
-                select(TI)
-                .with_hint(TI, "USE INDEX (ti_state)", dialect_name="mysql")
-                .join(TI.dag_run)
-                .where(DR.state == DagRunState.RUNNING)
-                .join(TI.dag_model)
-                .where(not_(DM.is_paused))
-                .where(TI.state == TaskInstanceState.SCHEDULED)
-                .options(selectinload(TI.dag_model))
-                .order_by(-TI.priority_weight, DR.execution_date, TI.map_index)
+
+            # Subquery to get the current active task count for each DAG
+            # Only considering tasks from running DAG runs
+            current_active_tasks = (
+                session.query(
+                    TI.dag_id,
+                    func.count().label('active_count')
+                )
+                .join(DR, and_(DR.dag_id == TI.dag_id, DR.run_id == TI.run_id))
+                .filter(DR.state == DagRunState.RUNNING)
+                .filter(TI.state.in_([TaskInstanceState.RUNNING, TaskInstanceState.QUEUED]))
+                .group_by(TI.dag_id)
+                .subquery()
             )
 
-            if starved_pools:
-                query = query.where(not_(TI.pool.in_(starved_pools)))
+            # Get the limit for each DAG
+            dag_limit_subquery = (
+                session.query(
+                    DM.dag_id,
+                    func.greatest(DM.max_active_tasks - func.coalesce(current_active_tasks.c.active_count, 0), 0).label('dag_limit')
+                )
+                .outerjoin(current_active_tasks, DM.dag_id == current_active_tasks.c.dag_id)
+                .subquery()
+            )
 
-            if starved_dags:
-                query = query.where(not_(TI.dag_id.in_(starved_dags)))
+            # Subquery to rank tasks within each DAG
+            ranked_tis = (
+                session.query(
+                    TI,
+                    func.row_number().over(
+                        partition_by=TI.dag_id,
+                        order_by=[desc(TI.priority_weight), TI.start_date]
+                    ).label('row_number'),
+                    dag_limit_subquery.c.dag_limit
+                )
+                .join(TI.dag_run)
+                .join(DM, TI.dag_id == DM.dag_id)
+                .join(dag_limit_subquery, TI.dag_id == dag_limit_subquery.c.dag_id)
+                .filter(
+                    DR.state == DagRunState.RUNNING,
+                    DR.run_type != DagRunType.BACKFILL_JOB,
+                    ~DM.is_paused,
+                    ~TI.dag_id.in_(starved_dags),
+                    ~TI.pool.in_(starved_pools),
+                    TI.state == TaskInstanceState.SCHEDULED,
+                )
+            ).subquery()
 
             if starved_tasks:
                 task_filter = tuple_in_condition((TI.dag_id, TI.task_id), starved_tasks)
                 query = query.where(not_(task_filter))
 
-            if starved_tasks_task_dagrun_concurrency:
-                task_filter = tuple_in_condition(
-                    (TI.dag_id, TI.run_id, TI.task_id),
-                    starved_tasks_task_dagrun_concurrency,
-                )
-                query = query.where(not_(task_filter))
 
-            query = query.limit(max_tis)
+            final_query = (
+                session.query(TI)
+                .with_hint(TI, "USE INDEX (ti_state)", dialect_name="mysql")
+                .join(
+                    ranked_tis,
+                    and_(
+                        TI.task_id == ranked_tis.c.task_id,
+                        TI.dag_id == ranked_tis.c.dag_id,
+                        TI.run_id == ranked_tis.c.run_id
+                    )
+                )
+                .filter(ranked_tis.c.row_number <= ranked_tis.c.dag_limit)
+                .order_by(desc(ranked_tis.c.priority_weight), ranked_tis.c.start_date)
+                .limit(max_tis)
+            )
+            
+            
 
             timer = Stats.timer("scheduler.critical_section_query_duration")
             timer.start()
 
             try:
-                query = with_row_locks(query, of=TI, session=session, skip_locked=True)
+                query = with_row_locks(final_query, of=TI, session=session, skip_locked=True)
                 task_instances_to_examine: list[TI] = session.scalars(query).all()
 
                 timer.stop(send=True)
